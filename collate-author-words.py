@@ -3,9 +3,13 @@
 # git log -p -U0 --date=raw | python ../collate-author-words.py > ../author_rank
 
 import sys, string, re, math, heapq, sgt, operator, subprocess
+import matplotlib.pyplot as plt
+import numpy as np
 from datetime import datetime
 from pprint import pprint
+plt.rcdefaults()
 
+limit = 50000
 cmd = "git --git-dir linux-history/.git log -p -U0 --date=raw".split(' ')
 
 # reads the output of `git log -p -U0 --date=raw`
@@ -21,8 +25,8 @@ class ChangeRecord:
   def __init__(self, new_filename, old_filename):
     self.new_filename = new_filename
     self.old_filename = old_filename
-    self.add_terms = set()
-    self.del_terms = set()
+    self.add_terms = {}
+    self.del_terms = {}
 
 
 def dir_from_filename(f):
@@ -46,7 +50,22 @@ re_c_string = re.compile(r'''(?x)   # verbose mode
     "          # a literal double-quote
   ''')
 
-def accumulate_terms(text, tset,
+re_c_char = re.compile(r'''(?x)   # verbose mode
+    (?<!\\)    # not preceded by a backslash
+    '          # a literal single-quote
+    .*?        # 0-or-more characters
+    (?<!\\)    # not preceded by a backslash
+    '          # a literal single-quote
+  ''')
+
+re_c_includeang = re.compile(r'''(?x)  # verbose mode
+  (?<=\#include )  # preceded by #include
+  <                # a literal left-angle
+  [^>\s]*          # nonspaces
+  >                # a literal right-angle
+  ''')
+
+def accumulate_unigrams(text, tcounts,
       skipcomment=True, genericstring=True, genericdigit=True):
   if skipcomment:
     if re.match(r'^\s*\*\s', text):
@@ -54,12 +73,15 @@ def accumulate_terms(text, tset,
     text = text.split('/*')[0]
     text = text.split('//')[0]
   if genericstring:
-    text = re.sub(re_c_string, ' $ ', text)
+    text = re.sub(re_c_string, ' "s" ', text)
+    text = re.sub(re_c_char, " 'c' ", text)
+    text = re.sub(re_c_includeang, ' "i" ', text)
   # text = text.translate(replace_punctuation)
   text = re.sub(r'(->|[<>!=~]+|\|\||&&|\+\+|--|::|[\[\]{}.,;()\-+*/^%&?:\|&])', r' \1 ', text)
   if genericdigit:
     text = re.sub(r'0x([a-fA-F\d]+)|(\d+)', flatten_digits_impl, text)
-  tset.update(text.split())
+  for word in text.split():
+    tcounts[word] = tcounts.get(word, 0) + 1
 
 def interesting_file(filename):
   return (filename.endswith('.c') or filename.endswith('.h')) and (not '/staging/' in filename)
@@ -98,9 +120,9 @@ def readrecord(inp):
       else:
         current_change = None
     elif line.startswith('+') and current_change:
-      accumulate_terms(line[1:], current_change.add_terms)
+      accumulate_unigrams(line[1:], current_change.add_terms)
     elif line.startswith('-') and current_change:
-      accumulate_terms(line[1:], current_change.del_terms)
+      accumulate_unigrams(line[1:], current_change.del_terms)
 
 class UnigramModel:
   def __init__(self, d=None):
@@ -108,17 +130,21 @@ class UnigramModel:
     self.total_count = 0
     if d is not None:
       self.update(d)
-  def add(self, word):
-    self.unigram_counts[word] = self.unigram_counts.get(word, 0) + 1
-    self.total_count += 1
+  def add(self, word, c):
+    self.unigram_counts[word] = self.unigram_counts.get(word, 0) + c
+    self.total_count += c
   def update(self, words):
     if isinstance(words, UnigramModel):
       for word in words.unigram_counts:
         c = words.unigram_counts[word]
         self.unigram_counts[word] = self.unigram_counts.get(word, 0) + c
         self.total_count += c
-    for word in words:
-      self.add(word)
+    elif isinstance(words, dict):
+      for word, count in words.iteritems():
+        self.add(word, count)
+    elif isinstance(words, set):
+      for word in words:
+        self.add(word, 1)
   def p(self, word):
     if word not in self.unigram_counts:
       return float(self.unigram_counts['']) / self.total_count
@@ -132,6 +158,8 @@ class UnigramModel:
     return sum([self.bits(word) * other.p(word) for word in words])
   def top_words(self, n=10):
     return heapq.nlargest(n, self.unigram_counts, key=self.unigram_counts.get)
+  def top_wordcounts(self, n=10):
+    return [(word, self.unigram_counts[word]) for word in self.top_words(n)]
   def smooth(self):
     # Smooth with simple Good-Turing.
     smoothed, unk = sgt.simpleGoodTuringProbs(self.unigram_counts)
@@ -154,7 +182,6 @@ class AuthorData:
 language_model = UnigramModel()
 author_data = {}
 dir_data = {}
-limit = 2000
 count = 0
 
 gp = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
@@ -203,4 +230,10 @@ for (dd, xe) in dir_rank:
     print 'dir %s has cross-entropy %f after %d docs' % (
           dd.name, xe, dd.document_count)
 
+def plot_lm(model, n=20):
+  d = [(word, model.unigram_counts[word]) for word in model.top_words(n)]
+  y_pos = n + 1 - np.arange(n)
+  plt.barh(y_pos, [data[1] for data in d], align='center', alpha=0.4)
+  plt.yticks(y_pos, [data[0] for data in d])
+  plt.show()
 
